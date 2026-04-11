@@ -1,26 +1,20 @@
 /**
  * MoneyTracker Pro Service Worker
- * Version: 4.0.0 - Mode Hors Ligne Robuste
+ * Version: 4.1.0 - Mode Hors Ligne Robuste
  * Stratégie : Cache First, Network Fallback, puis Offline Page pour navigation
  * Assure que l'application est fonctionnelle même sans connexion.
  */
 
-const CACHE_VERSION = 'v4.0.0';
+const CACHE_VERSION = 'v4.1.0'; // Nouvelle version du cache
 const CACHE_NAME = `moneytracker-${CACHE_VERSION}`;
 
 // Liste de TOUS les assets nécessaires pour que l'application démarre et fonctionne hors ligne.
-// Comme tout est dans index.html, cette liste est simple.
+// Comme tout est dans index.html (y compris le CSS et JS), cette liste est simple.
+// Les bibliothèques CDN (jsPDF, html2canvas) seront gérées dynamiquement.
 const ASSETS_TO_CACHE = [
   './', // Ceci met en cache la page index.html si l'URL est la racine
   './index.html',
   './manifest.json'
-  // Si tu avais des fichiers CSS ou JS externes, il faudrait les ajouter ici :
-  // './styles.css',
-  // './app.js',
-  // './images/icon-192.png',
-  // './images/icon-512.png',
-  // Note: Les icônes sont maintenant des data-URL SVG intégrées dans manifest.json et index.html pour plus de robustesse.
-  // Les bibliothèques jsPDF et html2canvas sont chargées via CDN, leur mise en cache est gérée dynamiquement.
 ];
 
 // ========== INSTALL ==========
@@ -30,6 +24,8 @@ self.addEventListener('install', (event) => {
     caches.open(CACHE_NAME)
       .then((cache) => {
         console.log('[SW] Caching static assets:', ASSETS_TO_CACHE);
+        // Important: cache.addAll échoue si une ressource n'est pas disponible.
+        // Assure-toi que ces fichiers existent à la racine de ton serveur/GitHub Pages.
         return cache.addAll(ASSETS_TO_CACHE);
       })
       .then(() => {
@@ -38,6 +34,7 @@ self.addEventListener('install', (event) => {
       })
       .catch((error) => {
         console.error('[SW] Failed to cache core assets:', error);
+        // En cas d'échec, le SW ne s'activera pas, c'est mieux que de s'activer avec un cache partiel.
       })
   );
 });
@@ -68,8 +65,13 @@ self.addEventListener('fetch', (event) => {
   const request = event.request;
   const url = new URL(request.url);
 
+  // Exclure les requêtes "chrome-extension://" et autres protocoles non http(s)
+  if (!url.protocol.startsWith('http') && !url.protocol.startsWith('https')) {
+      return;
+  }
+
   // Si c'est une requête de navigation (chargement de page HTML)
-  if (request.mode === 'navigate' || (request.method === 'GET' && request.headers.get('accept').includes('text/html'))) {
+  if (request.mode === 'navigate' || (request.method === 'GET' && request.headers.get('accept')?.includes('text/html'))) {
     event.respondWith(
       fetch(request) // Essayer d'obtenir la version la plus récente depuis le réseau
         .then(response => {
@@ -103,17 +105,19 @@ self.addEventListener('fetch', (event) => {
         // Sinon, tenter de la récupérer du réseau
         return fetch(request)
           .then((networkResponse) => {
-            // Si la requête réseau réussit, mettez la ressource en cache
+            // Si la requête réseau réussit et que c'est une ressource valide à mettre en cache
             if (networkResponse.ok && networkResponse.type === 'basic') { // 'basic' pour les requêtes same-origin
               caches.open(CACHE_NAME).then(cache => {
                 cache.put(request, networkResponse.clone());
               });
-            } else if (networkResponse.ok && (url.hostname.includes('jsdelivr') || url.hostname.includes('html2canvas') || url.hostname.includes('jspdf'))) {
-              // Gérer spécifiquement les CDN comme jsPDF/html2canvas.
-              // Ils doivent être mis en cache dynamiquement pour fonctionner hors ligne après le premier chargement.
-              caches.open(CACHE_NAME).then(cache => {
-                cache.put(request, networkResponse.clone());
-              });
+            } 
+            // Gérer spécifiquement les bibliothèques CDN : jsPDF et html2canvas
+            // Ces URLs contiennent typiquement "jsdelivr", "cdnjs" ou "html2canvas", "jspdf" dans leur chemin.
+            else if (networkResponse.ok && (url.hostname.includes('cdnjs.cloudflare.com') || url.hostname.includes('html2canvas.hertzen.com'))) {
+                caches.open(CACHE_NAME).then(cache => {
+                    console.log('[SW] Dynamically caching CDN resource:', request.url);
+                    cache.put(request, networkResponse.clone());
+                });
             }
             return networkResponse;
           })
@@ -128,8 +132,9 @@ self.addEventListener('fetch', (event) => {
                 { headers: { 'Content-Type': 'image/svg+xml' } }
               );
             }
-            // Pour les autres types de ressources, on laisse potentiellement le navigateur afficher une erreur,
-            // ou on peut ici renvoyer un fichier de fallback générique si on en a un.
+            // Pour les autres types de ressources, si ce n'est pas un fichier statique déjà mis en cache,
+            // ou un CDN qui devrait être en cache dynamique, cela pourrait être une erreur.
+            // Le comportement par défaut est de laisser l'erreur se propager, ce qui affiche la page d'erreur du navigateur.
             // Pour une PWA self-contained comme celle-ci, la plupart des assets critiques sont déjà dans index.html
             // ou mis en cache statiquement.
             throw new Error('Ressource non disponible hors ligne et réseau échoué.');
@@ -143,6 +148,10 @@ self.addEventListener('message', (event) => {
   if (event.data?.type === 'SKIP_WAITING') {
     self.skipWaiting();
   }
+  if (event.data?.type === 'CLEAR_CACHE') {
+    caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k))))
+      .then(() => event.ports[0]?.postMessage({ success: true }));
+  }
 });
 
 // ========== BACKGROUND SYNC (si tu as besoin de synchroniser des données plus tard) ==========
@@ -154,10 +163,9 @@ self.addEventListener('sync', (event) => {
 });
 
 async function syncTransactions() {
-  // Ici, tu mettrais la logique pour envoyer les transactions mises en file d'attente
-  // lorsque l'application était hors ligne vers un serveur distant, si tu en avais un.
   console.log('[SW] Attempting to sync transactions to server...');
-  // Exemple: Lire depuis IndexedDB, envoyer via fetch, puis supprimer de IndexedDB
+  // Cette fonction serait à implémenter si tu avais un backend.
+  // Pour une app purement client-side (comme MoneyTracker Pro), cela n'est pas nécessaire.
 }
 
 console.log('[SW] Service Worker loaded - v' + CACHE_VERSION);
